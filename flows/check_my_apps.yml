@@ -1,0 +1,89 @@
+id: check_my_apps
+namespace: aurora.monitoring
+description: Checks my live apps every hour, alerts my phone if one is down, and can be called by an AI agent over MCP.
+
+tasks:
+  # Is the Mypetravel website up? Expect a normal page (200).
+  - id: check_mypetravel_site
+    type: io.kestra.plugin.core.http.Request
+    uri: https://mypetravel.com
+    retry:                      # a blip is not an outage: 3 tries, 30s apart
+      type: constant
+      interval: PT30S
+      maxAttempts: 3
+
+  # Is the Ask Claude Worker up? Without a login it must answer 401.
+  # A 200 here would mean the API is open to anyone, so 401 is the healthy answer.
+  - id: check_ask_claude_worker
+    type: io.kestra.plugin.core.http.Request
+    uri: https://mypetravel-api.fridaynight.workers.dev/chat
+    method: POST
+    headers:
+      Origin: https://mypetravel.com
+    options:
+      allowFailed: true         # we check the code ourselves
+
+  - id: worker_must_refuse_strangers
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ outputs.check_ask_claude_worker.code != 401 }}"
+    errorMessage: "Worker answered {{ outputs.check_ask_claude_worker.code }} instead of 401"
+
+  # Is Geekasong up?
+  - id: check_geekasong
+    type: io.kestra.plugin.core.http.Request
+    uri: https://geekasong.com
+    retry:
+      type: constant
+      interval: PT30S
+      maxAttempts: 3
+
+  - id: all_good
+    type: io.kestra.plugin.core.log.Log
+    message: >
+      All apps up. Mypetravel {{ outputs.check_mypetravel_site.code }},
+      Worker {{ outputs.check_ask_claude_worker.code }},
+      Geekasong {{ outputs.check_geekasong.code }}
+
+# What the flow returns when called (by an AI agent, the API, or a person).
+outputs:
+  - id: status
+    type: STRING
+    value: >
+      Mypetravel site {{ outputs.check_mypetravel_site.code }},
+      Ask Claude Worker {{ outputs.check_ask_claude_worker.code }} (401 = healthy),
+      Geekasong {{ outputs.check_geekasong.code }}
+
+# Runs only when a task fails: push an alert to my phone via ntfy.
+# The topic name is private, so it lives in the KV store, not in this file.
+errors:
+  - id: alert_my_phone
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://ntfy.sh/{{ kv('ntfy_topic') }}"
+    method: POST
+    contentType: text/plain
+    headers:
+      Title: "App down: {{ errorLogs()[0]['taskId'] }}"
+      Priority: high
+      Tags: rotating_light
+    body: |
+      {{ errorLogs()[0]['message'] }}
+      Flow: {{ flow.namespace }}.{{ flow.id }}
+      Execution: {{ execution.id }}
+
+triggers:
+  # 1. Every hour.
+  - id: every_hour
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "@hourly"
+    timezone: Europe/Paris
+
+  # 2. As a tool any MCP client (Claude, Cursor...) can call.
+  - id: as_ai_tool
+    type: io.kestra.plugin.core.trigger.McpToolTrigger
+    title: Check my apps
+    toolName: check-my-apps
+    toolDescription: Checks whether Aurora's live apps (Mypetravel website, its Ask Claude API, and Geekasong) are up. Use when asked if her apps are working.
+    annotations:
+      readOnly: true
+      destructive: false
+      idempotent: true
