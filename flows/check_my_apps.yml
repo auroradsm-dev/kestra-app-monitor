@@ -1,88 +1,143 @@
 id: check_my_apps
 namespace: aurora.monitoring
-description: Checks my live apps every hour, alerts my phone if one is down, and can be called by an AI agent over MCP.
+description: Checks my live apps every hour, can be called by an AI agent over MCP, and fails when an app is down or slow (alerting is handled by aurora.alerts.alert_on_failure).
+
+inputs:
+  - id: app
+    type: SELECT
+    displayName: Which app to check
+    description: Pick one app, or all of them.
+    values:
+      - label: "All apps"
+        value: all
+      - label: "Mypetravel"
+        value: mypetravel
+      - label: "Geekasong"
+        value: geekasong
+    defaults: all
+
+  - id: max_response_ms
+    type: INT
+    displayName: Slowest acceptable response (ms)
+    description: A site slower than this counts as a problem.
+    defaults: 2000
 
 tasks:
-  # Is the Mypetravel website up? Expect a normal page (200).
-  - id: check_mypetravel_site
-    type: io.kestra.plugin.core.http.Request
-    uri: https://mypetravel.com
-    retry:                      # a blip is not an outage: 3 tries, 30s apart
-      type: constant
-      interval: PT30S
-      maxAttempts: 3
+  - id: what_was_asked
+    type: io.kestra.plugin.core.log.Log
+    message: "Check requested for: {{ inputs.app }}, limit {{ inputs.max_response_ms }} ms"
 
-  # Is the Ask Claude Worker up? Without a login it must answer 401.
-  # A 200 here would mean the API is open to anyone, so 401 is the healthy answer.
-  - id: check_ask_claude_worker
-    type: io.kestra.plugin.core.http.Request
-    uri: https://mypetravel-api.fridaynight.workers.dev/chat
-    method: POST
-    headers:
-      Origin: https://mypetravel.com
-    options:
-      allowFailed: true         # we check the code ourselves
+  # Run the selected apps' checks side by side.
+  - id: run_checks
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: mypetravel_branch
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.app == 'all' or inputs.app == 'mypetravel' }}"
+        then:
+          - id: check_mypetravel_site
+            type: io.kestra.plugin.core.http.Request
+            uri: https://mypetravel.com
+            retry:
+              type: constant
+              interval: PT30S
+              maxAttempts: 3
 
-  - id: worker_must_refuse_strangers
+          # Without a login the Worker must answer 401: that is the healthy answer.
+          - id: check_ask_claude_worker
+            type: io.kestra.plugin.core.http.Request
+            uri: https://mypetravel-api.fridaynight.workers.dev/chat
+            method: POST
+            headers:
+              Origin: https://mypetravel.com
+            options:
+              allowFailed: true
+
+          - id: worker_must_refuse_strangers
+            type: io.kestra.plugin.core.execution.Fail
+            condition: "{{ outputs.check_ask_claude_worker.code != 401 }}"
+            errorMessage: "Worker answered {{ outputs.check_ask_claude_worker.code }} instead of 401"
+
+      - id: geekasong_branch
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.app == 'all' or inputs.app == 'geekasong' }}"
+        then:
+          - id: check_geekasong
+            type: io.kestra.plugin.core.http.Request
+            uri: https://geekasong.com
+            retry:
+              type: constant
+              interval: PT30S
+              maxAttempts: 3
+
+  # Time each selected site in Python, in a throwaway container.
+  - id: measure_response_times
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.13-slim
+    beforeCommands:
+      - pip install --quiet requests kestra
+    script: |
+      import time
+      import requests
+      from kestra import Kestra
+
+      app = "{{ inputs.app }}"
+      sites = {
+          "mypetravel": "https://mypetravel.com",
+          "geekasong": "https://geekasong.com",
+      }
+
+      results = {}
+      for name, url in sites.items():
+          if app in ("all", name):
+              start = time.perf_counter()
+              response = requests.get(url, timeout=10)
+              ms = round((time.perf_counter() - start) * 1000)
+              print(f"{name}: {response.status_code} in {ms} ms")
+              results[f"{name}_ms"] = ms
+
+      results["slowest_ms"] = max(results.values()) if results else 0
+      Kestra.outputs(results)
+
+  - id: too_slow
     type: io.kestra.plugin.core.execution.Fail
-    condition: "{{ outputs.check_ask_claude_worker.code != 401 }}"
-    errorMessage: "Worker answered {{ outputs.check_ask_claude_worker.code }} instead of 401"
+    condition: "{{ outputs.measure_response_times.vars.slowest_ms > inputs.max_response_ms }}"
+    errorMessage: "Too slow: {{ outputs.measure_response_times.vars.slowest_ms }} ms (limit {{ inputs.max_response_ms }} ms)"
 
-  # Is Geekasong up?
-  - id: check_geekasong
-    type: io.kestra.plugin.core.http.Request
-    uri: https://geekasong.com
-    retry:
-      type: constant
-      interval: PT30S
-      maxAttempts: 3
-
-  - id: all_good
+  # ?? = fallback when a check was skipped.
+  - id: summary
     type: io.kestra.plugin.core.log.Log
     message: >
-      All apps up. Mypetravel {{ outputs.check_mypetravel_site.code }},
-      Worker {{ outputs.check_ask_claude_worker.code }},
-      Geekasong {{ outputs.check_geekasong.code }}
+      Mypetravel {{ outputs.check_mypetravel_site.code ?? 'not checked' }}
+      in {{ outputs.measure_response_times.vars.mypetravel_ms ?? '-' }} ms,
+      Worker {{ outputs.check_ask_claude_worker.code ?? 'not checked' }},
+      Geekasong {{ outputs.check_geekasong.code ?? 'not checked' }}
+      in {{ outputs.measure_response_times.vars.geekasong_ms ?? '-' }} ms
 
-# What the flow returns when called (by an AI agent, the API, or a person).
 outputs:
   - id: status
     type: STRING
     value: >
-      Mypetravel site {{ outputs.check_mypetravel_site.code }},
-      Ask Claude Worker {{ outputs.check_ask_claude_worker.code }} (401 = healthy),
-      Geekasong {{ outputs.check_geekasong.code }}
-
-# Runs only when a task fails: push an alert to my phone via ntfy.
-# The topic name is private, so it lives in the KV store, not in this file.
-errors:
-  - id: alert_my_phone
-    type: io.kestra.plugin.core.http.Request
-    uri: "https://ntfy.sh/{{ kv('ntfy_topic') }}"
-    method: POST
-    contentType: text/plain
-    headers:
-      Title: "App down: {{ errorLogs()[0]['taskId'] }}"
-      Priority: high
-      Tags: rotating_light
-    body: |
-      {{ errorLogs()[0]['message'] }}
-      Flow: {{ flow.namespace }}.{{ flow.id }}
-      Execution: {{ execution.id }}
+      Checked: {{ inputs.app }}.
+      Mypetravel site {{ outputs.check_mypetravel_site.code ?? 'not checked' }}
+      ({{ outputs.measure_response_times.vars.mypetravel_ms ?? '-' }} ms),
+      Ask Claude Worker {{ outputs.check_ask_claude_worker.code ?? 'not checked' }} (401 = healthy),
+      Geekasong {{ outputs.check_geekasong.code ?? 'not checked' }}
+      ({{ outputs.measure_response_times.vars.geekasong_ms ?? '-' }} ms)
 
 triggers:
-  # 1. Every hour.
   - id: every_hour
     type: io.kestra.plugin.core.trigger.Schedule
     cron: "@hourly"
     timezone: Europe/Paris
 
-  # 2. As a tool any MCP client (Claude, Cursor...) can call.
   - id: as_ai_tool
     type: io.kestra.plugin.core.trigger.McpToolTrigger
     title: Check my apps
     toolName: check-my-apps
-    toolDescription: Checks whether Aurora's live apps (Mypetravel website, its Ask Claude API, and Geekasong) are up. Use when asked if her apps are working.
+    toolDescription: Aurora's own monitoring for her apps Mypetravel and Geekasong. Use this tool, rather than browsing the websites, whenever she asks if Mypetravel, Geekasong or "my apps" are up, working, slow or down. It checks the website, the Ask Claude API (where 401 means healthy) and response times. Use app=mypetravel, app=geekasong, or app=all.
     annotations:
       readOnly: true
       destructive: false

@@ -1,0 +1,25 @@
+id: alert_on_failure
+namespace: aurora.alerts
+description: Watches every flow in aurora.monitoring and pushes an alert to my phone when one fails. Lives outside the namespace it watches so it can never trigger itself.
+
+tasks:
+  - id: alert_my_phone
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://ntfy.sh/{{ secret('NTFY_TOPIC') }}"
+    method: POST
+    contentType: text/plain
+    headers:
+      Title: "Flow failed: {{ trigger.flowId }}"
+      Priority: high
+      Tags: rotating_light
+    body: |
+      {{ trigger.namespace }}.{{ trigger.flowId }} ended {{ trigger.state }}
+      Execution: {{ trigger.executionId }}
+
+triggers:
+  - id: any_monitoring_flow_fails
+    type: io.kestra.plugin.core.trigger.Flow
+    states:
+      - FAILED
+      - WARNING
+    when: "{{ flow.namespace | startsWith('aurora.monitoring') }}"
